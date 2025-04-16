@@ -8,3 +8,4 @@ ipykernel
 ipywidgets
 pycocotools
 utils
+torch.utils
