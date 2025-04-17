@@ -9,3 +9,6 @@ ipywidgets
 pycocotools
 utils
 torch.utils
+albumentations
+test
+train
