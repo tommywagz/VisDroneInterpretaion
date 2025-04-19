@@ -1,9 +1,7 @@
 import os
-import json
 import numpy as np
 from PIL import Image
 from collections import defaultdict, OrderedDict
-import time
 import math
 import sys
 import torch
@@ -26,7 +24,6 @@ from albumentations.pytorch import ToTensorV2
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-# from test import MFasterRCNN, ModifiedFPN, ModifiedRoIHeads, ModifiedBoxHead
 from utils import MetricLogger, SmoothedValue
 
 # Define VisDroneDataset class 
@@ -72,9 +69,7 @@ class VisDroneDataset(Dataset):
         img_name = self.image_files[idx]
         img_path = os.path.join(self.img_dir, img_name)
         anno_path = os.path.join(self.annotation_dir, self.image_files[idx].replace('.jpg', '.txt').replace('.png', '.txt'))  # Adjust extension as needed
-
         # annotation_data = self.annotations[img_name]
-
         img = Image.open(img_path).convert("RGB")
         boxes = []
         labels = []
@@ -99,18 +94,21 @@ class VisDroneDataset(Dataset):
                         # else:
                         #     print(f"Warning: Invalid bounding box found and skipped in {anno_path}: {line.strip()}")
 
-
         except FileNotFoundError:
             print(f"Annotation file not found: {anno_path}")
             pass # Return empty lists
 
-        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        if boxes:
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        else:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            
         labels = torch.as_tensor(labels, dtype=torch.int64)
         area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]) if boxes.numel() > 0 else torch.zeros(0) #added check
         iscrowd = torch.zeros((boxes.shape[0],), dtype=torch.int64) if boxes.numel() > 0 else torch.zeros(0) #added check
 
         target = {}
-        target['boxes'] = boxes
+        target['boxes'] = boxes            
         target['labels'] = labels
         target['image_id'] = torch.tensor([idx])
         target['area'] = area
@@ -134,6 +132,9 @@ class VisDroneDataset(Dataset):
             target['labels'] = torch.as_tensor(transformed['labels'], dtype=torch.int64)
 
         assert torch.all((target['labels'] >= 0) & (target['labels'] < self.num_classes)), f"Bad labels: {target['labels']}"
+
+        if target['boxes'].numel() == 0:
+            return None
 
         return img, target
 
@@ -159,7 +160,13 @@ def get_transform(train):
     return A.Compose(transforms, bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels'], min_visibility=0.3))
 
 def collate_fn(batch):
-    return tuple(zip(*batch))       
+    # Filter out None samples
+    batch = [item for item in batch if item is not None]
+
+    if len(batch) == 0:
+        return None  # or raise an error, depending on your strategy
+
+    return tuple(zip(*batch))
 
 def evaluate(model, data_loader, device):
     model.eval()
@@ -183,24 +190,23 @@ def evaluate(model, data_loader, device):
         results = []
         for i, output in enumerate(outputs):
             image_id = targets[i]["image_id"].item()
-            if 'boxes' in output:
-                boxes = output['boxes'].cpu().tolist()
-                scores = output['scores'].cpu().tolist()
-                labels = output['labels'].cpu().tolist()
-                for box, score, label in zip(boxes, scores, labels):
-                    results.append({
-                        'image_id': image_id,
-                        'bbox': [box[0], box[1], box[2] - box[0], box[3] - box[1]],
-                        'score': score,
-                        'category_id': label
-                    })
-            
+            boxes = output['boxes'].cpu()
+            scores = output['scores'].cpu()
+            labels = output['labels'].cpu()
+
+            for box, score, label in zip(boxes, scores, labels):
+                bbox = [box[0].item(), box[1].item(), box[2].item() - box[0].item(), box[3].item() - box[1].item()]
+                results.append({
+                    'image_id': image_id,
+                    'bbox': bbox,
+                    'score': score.item(),
+                    'category_id': label.item()
+                })
+
         coco_evaluator.update(results)
 
     # gather the stats from all processes
     coco_evaluator.synchronize_between_processes()
-
-    # accumulate predictions from all images
     coco_evaluator.accumulate()
     coco_evaluator.summarize()
 
@@ -208,6 +214,11 @@ def evaluate(model, data_loader, device):
 
 def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq, scaler=None):
     model.train()
+    
+    for m in model.backbone.modules():
+        if isinstance(m, torch.nn.BatchNorm2d):
+            m.eval()
+            
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = f'Epoch: [{epoch}]'
@@ -228,7 +239,11 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq, sc
 
         lr_scheduler = warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor)
 
-    for images, targets in metric_logger.log_every(data_loader, print_freq, header):
+    for batch in metric_logger.log_every(data_loader, print_freq, header):
+        if batch is None:
+            continue
+        
+        images, targets = batch
         images = list(image.to(device) for image in images)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -322,7 +337,8 @@ class CocoEvaluator:
         self.predictions = defaultdict(list)
 
     def update(self, predictions):
-        for image_id, prediction in predictions.items():
+        for prediction in predictions:
+            image_id = prediction["image_id"]
             self.predictions[image_id].append(prediction)
             
     def synchronize_between_processes(self):
@@ -352,25 +368,15 @@ class CocoEvaluator:
 
 def _create_coco_results(coco_gt, predictions, iou_type):
     results = []
+    id = 1
     for image_id, prediction in predictions.items():
-        if len(prediction) == 0:
-            continue
-
-        boxes = prediction["boxes"].tolist()
-        scores = prediction["scores"].tolist()
-        labels = prediction["labels"].tolist()
-
-        coco_predictions = []
-        for box, score, label in zip(boxes, scores, labels):
-            coco_predictions.append(
-                {
-                    "image_id": image_id,
-                    "bbox": [box[0], box[1], box[2] - box[0], box[3] - box[1]],
-                    "score": score,
-                    "category_id": int(label),
-                }
-            )
-        results.extend(coco_predictions)
+        for pred in prediction:
+            x, y, w, h = pred['bbox']
+            pred['area'] = w*h
+            pred['id'] = id
+            id += 1
+            results.append(pred)
+            
     return results
 
 def convertToCOCO(dataset):
@@ -496,20 +502,20 @@ def main():
     # test_dataset = VisDroneDataset(test_img_dir, test_anno_dir, transforms=test_transforms) # If test annotations are available
 
     # Define data loaders
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=1, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=1, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=1, collate_fn=collate_fn, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=1, collate_fn=collate_fn, drop_last=True)
     # test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, num_workers=2, collate_fn=collate_fn) # If test annotations are available
 
     # Define hyperparameters (reflecting the paper)
     num_classes = 11
-    learning_rate = 0.0001 # Assuming a tuned learning rate
+    learning_rate = 0.001 # Assuming a tuned learning rate
     weight_decay = 0.0005 # Assuming a tuned weight decay
-    num_epochs = 5
+    num_epochs = 3
     print_freq = 100
     lr_step_size = 3
     lr_gamma = 0.1
 
-    # Load pre-trained ResNet-34 backbone
+    # Load pre-trained mobilenet-34 backbone
     mobilenet_backbone = models.mobilenet_v3_large(weights='DEFAULT').features
     
     # Downsampling to improve efficiency    
@@ -524,29 +530,29 @@ def main():
     # You'll need to inspect the MobileNetV3 architecture to determine suitable layers
     # These layer indices might need adjustment based on the exact architecture
     feature_layers = OrderedDict()
-    feature_layers['0'] = mobilenet_backbone[0:2]  # Example: First few layers
-    feature_layers['1'] = mobilenet_backbone[2:4]  # Example: Next few layers
-    feature_layers['2'] = mobilenet_backbone[4:7]
-    feature_layers['3'] = mobilenet_backbone[7:10]
-    feature_layers['4'] = mobilenet_backbone[10:13]
-    feature_layers['5'] = mobilenet_backbone[13:]
-    feature_layers['6'] = extra_layers[0:2]
-    feature_layers['7'] = extra_layers[2:]   
+    feature_layers['0'] = mobilenet_backbone[2]  # Example: First few layers
+    feature_layers['1'] = mobilenet_backbone[4]  # Example: Next few layers
+    feature_layers['2'] = mobilenet_backbone[7]
+    feature_layers['3'] = mobilenet_backbone[10]
+    feature_layers['4'] = mobilenet_backbone[13]
+    feature_layers['5'] = mobilenet_backbone[-1]
+    feature_layers['6'] = extra_layers[0]
+    feature_layers['7'] = extra_layers[2]   
             
     # Define the output channels for each feature map
     # You'll need to get these from the MobileNetV3 architecture definition
-    feature_channels = [16, 24, 40, 80, 112, 960, 512, 256] 
-    
+    feature_channels = [24, 40, 80, 112, 960, 512, 256] 
+                
     # Create the backbone using the defined feature layers
     backbone = torch.nn.Sequential(feature_layers)
     backbone.out_channels = feature_channels # Set the out_channels attribute
     
     # Define anchor generator with adjusted parameters
     anchor_generator = DefaultBoxGenerator(
-        min_ratio=20,
-        max_ratio=90,
-        steps=[8, 16, 32, 64, 128, 256, 300, 300],
-        aspect_ratios=([2, 3],) * len(feature_channels)
+        min_ratio=3,
+        max_ratio=30,
+        steps=[8, 16, 32, 64, 128, 32, 64, 107],
+        aspect_ratios=([0.5, 1.0, 2.0],) * len(feature_channels)
     )
     
     # Define the SSD head with updated channel info
@@ -559,9 +565,9 @@ def main():
         num_classes=num_classes
     )
 
-    # Create your custom model
-    model = torchvision.models.detection.ssd300_vgg16(num_classes=11)
-    
+    # Create model
+    # model = torchvision.models.detection.ssd300_vgg16(num_classes=11)
+    model = ssd.SSD(backbone=backbone, anchor_generator=anchor_generator, size=(30,30), num_classes=num_classes, head=ssd_head)
     model.to(device)
 
     # Optimizer and learning rate scheduler

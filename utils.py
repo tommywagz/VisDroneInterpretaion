@@ -168,3 +168,4 @@ class MetricLogger:
 def is_dist_avail_and_initialized():
     # Simple placeholder function
     return False
+
