@@ -12,3 +12,5 @@ torch.utils
 albumentations
 test
 train
+opencv-python
+cuda

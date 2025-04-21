@@ -1,5 +1,7 @@
 myenv
 VisDrone2019-DET-train
+VisDrone2019-DET-val
+VisDrone2019-DET-test
 images
 annotations
 VisDrone2019-DET-train.zip
