@@ -25,14 +25,17 @@ class FilterInvalidBBoxesAndLabels(A.ImageOnlyTransform):
 
 def get_transform(train=True):
     transforms = [
+        A.Resize(height=320, width=320),
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),  # normalize before tensor
         ToTensorV2()
     ]
 
     if train:
         transforms = [
-            # A.HorizontalFlip(p=0.5),
-            # A.RandomBrightnessContrast(p=0.2),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(p=0.2),
+            A.RandomGamma(p=0.3),
+            A.HueSaturationValue(p=0.3),
             FilterInvalidBBoxesAndLabels(),
         ] + transforms  # add normalization and tensor conversion last
 

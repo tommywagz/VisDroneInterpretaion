@@ -14,11 +14,8 @@ from torch.optim import lr_scheduler
 import torch.distributed as dist
 import torch.nn as nn
 import torchvision.models as models
-import torchvision.models.detection as detection
+from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
 import torchvision.transforms.functional as F
-
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
@@ -62,10 +59,7 @@ class VisDroneDataset(Dataset):
                             if 0 < label < self.num_classes and score > 0:
                                 boxes.append([x, y, w, h])
                                 labels.append(label)
-                        #     else:
-                        #         print(f"Warning: Line {line} from {anno_path} \nWith label: {label}, truncation: {truncation}, score: {score} has been ignored")
-                        # else:
-                        #     print(f"Warning: Line {line} from {anno_path} has [x, y, x1, y1] : [{x}, {y}, {x+w}, {y+h}] has been ignored from image with size [{width}, {height}]")
+
 
                     except ValueError:
                         print(f"Annotation '{line}' at file '{anno_path}' could not be read")
@@ -382,19 +376,22 @@ def main():
     weight_decay = 0.0005 
     num_epochs = 50
     print_freq = 100
-    lr_step_size = 3
+    lr_step_size = 30
     lr_gamma = 0.1
 
     # Create model
     # model = SSDMobileNetV3(num_classes=num_classes)
     # model = ssd.SSD(backbone=backbone, anchor_generator=anchor_generator, size=(30,30), num_classes=num_classes, head=ssd_head)
-    model = ssd.ssd300_vgg16(
-        weights=ssd.SSD300_VGG16_Weights.DEFAULT 
-        # progress=True, 
-        # num_classes=num_classes, 
-        # weights_backbone=torchvision.models.VGG16_Weights, 
-        # trainable_backbone_layers=5
-    )
+    model = fasterrcnn_resnet50_fpn_v2(pretrained=True)
+    # model.transform.min_size = (512,)
+    # model.transform.max_size = 1024
+    # model = ssd.ssd300_vgg16(
+    #     weights=ssd.SSD300_VGG16_Weights.DEFAULT 
+    #     # progress=True, 
+    #     # num_classes=num_classes, 
+    #     # weights_backbone=torchvision.models.VGG16_Weights, 
+    #     # trainable_backbone_layers=5
+    # )
     model.to(device)
 
     # Optimizer and learning rate scheduler
@@ -411,7 +408,7 @@ def main():
         lr_scheduler.step()
         coco_evaluator = evaluate(model, val_loader, device)
         print(f"Epoch {epoch} Validation AP: {coco_evaluator.coco_eval['bbox'].stats[0]:.3f}")
-        if epoch == num_epochs - 1:
+        if epoch == num_epochs - 1 or epoch == 1:
             label_map = {i: name for i, name in enumerate(val_loader.dataset.classes)}
             visualize_sample(model, val_loader.dataset, idx=5, device=device, label_map=label_map)
 
